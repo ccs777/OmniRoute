@@ -1,64 +1,109 @@
-name: Build App
+name: INRouter Pinned Engine Build
 
-# Manual-only since #11946. The hosted 7 GB runner can no longer build this tree — 19 of
-# the last 30 runs died with "The runner has received a shutdown signal" (VM out of
-# memory) ~8 min into `next build`, release/v3.8.51 itself included, even with the 10 GB
-# swapfile below. Triggered on `push: branches: ["**"]` it painted every branch and every
-# PR red while producing an artefact nothing downloads. The bundle is validated where a
-# build actually fits:
-#   - main:       ci.yml `Build` (self-hosted omni-build pool) on every merge
-#   - release/**: nightly-release-green.yml (same pool, continuous)
-# Dispatch this workflow by hand when a hosted build artefact is genuinely needed.
 on:
   workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: inrouter-engine-build
+  cancel-in-progress: false
+
 jobs:
   build:
-    name: Fast Production Build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    env:
+      NEXT_TELEMETRY_DISABLED: "1"
+      OMNIROUTE_USE_TURBOPACK: "0"
+      OMNIROUTE_BUILD_MEMORY_MB: "6144"
+      NODE_OPTIONS: "--max-old-space-size=6144"
     steps:
-      - name: Expand Virtual Memory (Native 10GB Swap)
-        run: |
-          sudo swapoff -a || true
-          sudo rm -f /mnt/swapfile /swapfile
-          sudo fallocate -l 10G /mnt/swapfile || sudo dd if=/dev/zero of=/mnt/swapfile bs=1M count=10240
-          sudo chmod 600 /mnt/swapfile
-          sudo mkswap /mnt/swapfile
-          sudo swapon /mnt/swapfile
-          free -h
-
-      - name: Checkout repository
-        uses: actions/checkout@v7
+      - uses: actions/checkout@v4
         with:
           persist-credentials: false
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v7
+          fetch-depth: 0
+      - name: Verify audited source ancestry
+        run: git merge-base --is-ancestor af49d4972ed9b69e43f322453ebccca997a0ab94 HEAD
+      - uses: actions/setup-node@v4
         with:
-          node-version: "24"
+          node-version: "22.23.2"
           cache: npm
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Build Next.js app & CLI bundle
+      - name: Record platform and prepare build memory
         run: |
-          npm run build:release
+          mkdir -p "$RUNNER_TEMP/inrouter-evidence"
+          {
+            git rev-parse HEAD
+            node --version
+            npm --version
+            uname -m
+            cat /etc/os-release
+            ldd --version | head -1
+            sha256sum package-lock.json
+          } > "$RUNNER_TEMP/inrouter-evidence/platform.txt"
+          sudo fallocate -l 10G /mnt/inrouter-swap
+          sudo chmod 600 /mnt/inrouter-swap
+          sudo mkswap /mnt/inrouter-swap
+          sudo swapon /mnt/inrouter-swap
+          free -h
+      - name: Install pinned dependencies
+        run: npm ci 2>&1 | tee "$RUNNER_TEMP/inrouter-evidence/install.log"
+      - name: Core typecheck baseline
+        id: core
+        continue-on-error: true
+        run: npm run typecheck:core 2>&1 | tee "$RUNNER_TEMP/inrouter-evidence/typecheck-core.log"
+      - name: Strict core typecheck baseline
+        id: strict
+        continue-on-error: true
+        run: npm run typecheck:noimplicit:core 2>&1 | tee "$RUNNER_TEMP/inrouter-evidence/typecheck-strict.log"
+      - name: Focused autoCombo baseline
+        id: combo
+        continue-on-error: true
+        run: npx --no-install vitest run --config vitest.mcp.config.ts --maxWorkers=2 open-sse/services/autoCombo/__tests__/autoCombo.test.ts 2>&1 | tee "$RUNNER_TEMP/inrouter-evidence/autoCombo.log"
+      - name: Build standalone engine
+        id: bundle
+        run: npm run build 2>&1 | tee "$RUNNER_TEMP/inrouter-evidence/build.log"
+      - name: Archive deployable engine and notices
+        run: |
+          test -f .build/next/standalone/server.js
+          tar -czf "$RUNNER_TEMP/inrouter-evidence/omniroute-engine.tar.gz" \
+            --exclude='.build/next/cache' --exclude='.env' --exclude='.env.*' \
+            .build/next/standalone .build/next/static public LICENSE THIRD_PARTY_NOTICES.md
+          cd "$RUNNER_TEMP/inrouter-evidence"
+          sha256sum omniroute-engine.tar.gz > SHA256SUMS
+      - name: Record observed validation outcomes
+        if: always()
         env:
-          NODE_OPTIONS: "--max-old-space-size=12288"
-          OMNIROUTE_BUILD_MEMORY_MB: "12288"
-          OMNIROUTE_USE_TURBOPACK: "1"
-
-      - name: Archive build outputs
+          CORE_RESULT: ${{ steps.core.outcome }}
+          STRICT_RESULT: ${{ steps.strict.outcome }}
+          COMBO_RESULT: ${{ steps.combo.outcome }}
+          BUILD_RESULT: ${{ steps.bundle.outcome }}
         run: |
-          tar -czf omniroute-build.tar.gz .build dist
-
-      - name: Upload build artifact
+          mkdir -p "$RUNNER_TEMP/inrouter-evidence"
+          printf 'core=%s\nstrict=%s\nautoCombo=%s\nbuild=%s\n' \
+            "$CORE_RESULT" "$STRICT_RESULT" "$COMBO_RESULT" "$BUILD_RESULT" \
+            | tee "$RUNNER_TEMP/inrouter-evidence/outcomes.txt" >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload build and baseline evidence
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: omniroute-build
-          path: omniroute-build.tar.gz
+          name: inrouter-engine-${{ github.sha }}
+          path: ${{ runner.temp }}/inrouter-evidence/
           retention-days: 7
+          if-no-files-found: error
+      - name: Enforce baseline checks
+        if: always()
+        env:
+          CORE_RESULT: ${{ steps.core.outcome }}
+          STRICT_RESULT: ${{ steps.strict.outcome }}
+          COMBO_RESULT: ${{ steps.combo.outcome }}
+          BUILD_RESULT: ${{ steps.bundle.outcome }}
+        run: |
+          test "$CORE_RESULT" = success
+          test "$STRICT_RESULT" = success
+          test "$COMBO_RESULT" = success
+          test "$BUILD_RESULT" = success
